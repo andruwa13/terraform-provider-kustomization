@@ -2,13 +2,14 @@ package kustomize
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/hashicorp/terraform-plugin-sdk/helper/resource"
-	"github.com/hashicorp/terraform-plugin-sdk/helper/schema"
+	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 
+	k8scorev1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8smeta "k8s.io/apimachinery/pkg/api/meta"
 	k8smetav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +17,49 @@ import (
 	k8sschema "k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
+
+func kustomizationResourceSchemaV0() map[string]*schema.Schema {
+	return map[string]*schema.Schema{
+		"manifest": {
+			Type:     schema.TypeString,
+			Required: true,
+		},
+	}
+}
+
+func kustomizationResourceV0() *schema.Resource {
+	return &schema.Resource{
+		Schema: kustomizationResourceSchemaV0(),
+	}
+}
+
+func kustomizationResourceSchemaV1() map[string]*schema.Schema {
+	return map[string]*schema.Schema{
+		"manifest": {
+			Type:      schema.TypeString,
+			Required:  true,
+			Sensitive: true,
+		},
+		"resource": {
+			Type:     schema.TypeString,
+			Optional: true,
+			Computed: true,
+		},
+
+		"secret_data": {
+			Type:      schema.TypeString,
+			Sensitive: true,
+			Optional:  true,
+			Computed:  true,
+		},
+	}
+}
+
+func kustomizationResourceV1() *schema.Resource {
+	return &schema.Resource{
+		Schema: kustomizationResourceSchemaV1(),
+	}
+}
 
 func kustomizationResource() *schema.Resource {
 	return &schema.Resource{
@@ -30,18 +74,78 @@ func kustomizationResource() *schema.Resource {
 			State: kustomizationResourceImport,
 		},
 
-		Schema: map[string]*schema.Schema{
-			"manifest": &schema.Schema{
-				Type:     schema.TypeString,
-				Required: true,
+		Schema:        kustomizationResourceSchemaV1(),
+		SchemaVersion: 1,
+		StateUpgraders: []schema.StateUpgrader{
+			{
+				Version: 0,
+				Upgrade: v1StateUpgradeFunc,
+				Type:    kustomizationResourceV0().CoreConfigSchema().ImpliedType(),
 			},
 		},
 	}
 }
 
+func v1StateUpgradeFunc(rawState map[string]interface{}, meta interface{}) (map[string]interface{}, error) {
+	u, err := parseJSON(rawState["manifest"].(string))
+	if err != nil {
+		return nil, err
+	}
+	if u.GetKind() != "Secret" {
+		rawState["resource"] = rawState["manifest"]
+		rawState["secret_data"] = ""
+		return rawState, nil
+	}
+	rawState["secret_data"], rawState["resource"], err = extractSecretData(u)
+	return rawState, err
+}
+
+func extractSecretData(u *unstructured.Unstructured) (string, string, error) {
+	secretData, ok, err := unstructured.NestedMap(u.Object, "data")
+	secret := []byte{}
+	var updated *unstructured.Unstructured
+	if err != nil {
+		return "", "", err
+	}
+	if ok {
+		updated = u.DeepCopy()
+		unstructured.SetNestedField(updated.Object, "SENSITIVE", "data")
+		secret, err = json.Marshal(secretData)
+		if err != nil {
+			return "", "", err
+		}
+	}
+	data, err := updated.MarshalJSON()
+	if err != nil {
+		return "", "", err
+	}
+	return string(data), string(secret), nil
+}
+
+func updateStateFromResponse(d *schema.ResourceData, u *unstructured.Unstructured) error {
+	manifest := getLastAppliedConfig(u)
+	d.Set("manifest", manifest)
+
+	secretData := ""
+	if u.GetKind() == "Secret" {
+		configured, err := parseJSON(manifest)
+		if err != nil {
+			return err
+		}
+		manifest, secretData, err = extractSecretData(configured)
+		if err != nil {
+			return err
+		}
+	}
+	d.Set("resource", manifest)
+	d.Set("secret_data", secretData)
+	return nil
+}
+
 func kustomizationResourceCreate(d *schema.ResourceData, m interface{}) error {
 	client := m.(*Config).Client
 	mapper := m.(*Config).Mapper
+	gzipLastAppliedConfig := m.(*Config).GzipLastAppliedConfig
 
 	srcJSON := d.Get("manifest").(string)
 	u, err := parseJSON(srcJSON)
@@ -49,25 +153,7 @@ func kustomizationResourceCreate(d *schema.ResourceData, m interface{}) error {
 		return logError(fmt.Errorf("JSON parse error: %s", err))
 	}
 
-	stateConf := &resource.StateChangeConf{
-		Target:  []string{"existing"},
-		Pending: []string{"pending"},
-		Timeout: d.Timeout(schema.TimeoutCreate),
-		Refresh: func() (interface{}, string, error) {
-			// CRDs: wait for GroupVersionKind to exist
-			mapper.Reset()
-			mapping, err := mapper.RESTMapping(u.GroupVersionKind().GroupKind(), u.GroupVersionKind().Version)
-			if err != nil {
-				if k8smeta.IsNoMatchError(err) {
-					return nil, "pending", nil
-				}
-				return nil, "", err
-			}
-
-			return mapping.Resource, "existing", nil
-		},
-	}
-	gvrResp, err := stateConf.WaitForState()
+	gvrResp, err := waitForCRD(d, mapper, u)
 	if err != nil {
 		return logErrorForResource(
 			u,
@@ -79,13 +165,13 @@ func kustomizationResourceCreate(d *schema.ResourceData, m interface{}) error {
 
 	namespace := u.GetNamespace()
 
-	setLastAppliedConfig(u, srcJSON)
+	setLastAppliedConfig(u, srcJSON, gzipLastAppliedConfig)
 
 	if namespace != "" {
 		// wait for the namespace to exist
 		nsGvk := k8sschema.GroupVersionKind{
 			Group:   "",
-			Version: "",
+			Version: "v1",
 			Kind:    "Namespace"}
 		mapping, err := mapper.RESTMapping(nsGvk.GroupKind(), nsGvk.GroupVersion().Version)
 		if err != nil {
@@ -95,30 +181,44 @@ func kustomizationResourceCreate(d *schema.ResourceData, m interface{}) error {
 			)
 		}
 
-		stateConf := &resource.StateChangeConf{
-			Target:  []string{"existing"},
-			Pending: []string{"pending"},
-			Timeout: d.Timeout(schema.TimeoutCreate),
-			Refresh: func() (interface{}, string, error) {
-				resp, err := client.
-					Resource(mapping.Resource).
-					Get(context.TODO(), namespace, k8smetav1.GetOptions{})
-				if err != nil {
-					if k8serrors.IsNotFound(err) {
-						return nil, "pending", nil
-					}
-					return nil, "", err
-				}
-
-				return resp, "existing", nil
-			},
-		}
-		_, err = stateConf.WaitForState()
+		_, err = waitForGVKCreated(d, client, mapping, "", namespace)
 		if err != nil {
 			return logErrorForResource(
 				u,
 				fmt.Errorf("timed out waiting for apiVersion: %q, kind: %q, name: %q, to exist: %s", nsGvk.GroupVersion(), nsGvk.Kind, namespace, err),
 			)
+		}
+	}
+
+	// for secrets of type service account token
+	// wait for service account to exist
+	// https://github.com/kubernetes/kubernetes/issues/109401
+	if (u.GetKind() == "Secret") &&
+	   (u.UnstructuredContent()["type"].(string) == string(k8scorev1.SecretTypeServiceAccountToken)) {
+
+		annotations := u.GetAnnotations()
+		for k, v := range annotations {
+			if k == k8scorev1.ServiceAccountNameKey {
+				saGvk := k8sschema.GroupVersionKind{
+					Group:   "",
+					Version: "v1",
+					Kind:    "ServiceAccount"}
+				mapping, err := mapper.RESTMapping(saGvk.GroupKind(), saGvk.GroupVersion().Version)
+				if err != nil {
+					return logErrorForResource(
+						u,
+						fmt.Errorf("api server has no apiVersion: %q, kind: %q: %s", saGvk.GroupVersion(), saGvk.Kind, err),
+					)
+				}
+
+				_, err = waitForGVKCreated(d, client, mapping, namespace, v)
+				if err != nil {
+					return logErrorForResource(
+						u,
+						fmt.Errorf("timed out waiting for apiVersion: %q, kind: %q, namepsace: %q, name: %q, to exist: %s", saGvk.GroupVersion(), saGvk.Kind, namespace, v, err),
+					)
+				}
+			}
 		}
 	}
 
@@ -136,7 +236,7 @@ func kustomizationResourceCreate(d *schema.ResourceData, m interface{}) error {
 	id := string(resp.GetUID())
 	d.SetId(id)
 
-	d.Set("manifest", getLastAppliedConfig(resp))
+	d.Set("manifest", getLastAppliedConfig(resp, gzipLastAppliedConfig))
 
 	return kustomizationResourceRead(d, m)
 }
@@ -144,6 +244,7 @@ func kustomizationResourceCreate(d *schema.ResourceData, m interface{}) error {
 func kustomizationResourceRead(d *schema.ResourceData, m interface{}) error {
 	client := m.(*Config).Client
 	mapper := m.(*Config).Mapper
+	gzipLastAppliedConfig := m.(*Config).GzipLastAppliedConfig
 
 	srcJSON := d.Get("manifest").(string)
 	u, err := parseJSON(srcJSON)
@@ -173,19 +274,32 @@ func kustomizationResourceRead(d *schema.ResourceData, m interface{}) error {
 	id := string(resp.GetUID())
 	d.SetId(id)
 
-	d.Set("manifest", getLastAppliedConfig(resp))
+
 
 	return nil
 }
 
-func kustomizationResourceDiff(d *schema.ResourceDiff, m interface{}) error {
+func kustomizationResourceDiff(ctx context.Context, d *schema.ResourceDiff, m interface{}) error {
 	client := m.(*Config).Client
 	mapper := m.(*Config).Mapper
 
 	originalJSON, modifiedJSON := d.GetChange("manifest")
 
-	if !d.HasChange("manifest") {
-		return nil
+	modifiedSrcJSON := modifiedJSON.(string)
+	mu, err := parseJSON(modifiedSrcJSON)
+	if err != nil {
+		return logError(fmt.Errorf("JSON parse error: %s", err))
+	}
+	if mu.GetKind() == "Secret" {
+		cleanedResource, secretData, err := extractSecretData(mu)
+		if err != nil {
+			return logError(fmt.Errorf("Couldn't extract secret: %s", err))
+		}
+		d.SetNew("resource", string(cleanedResource))
+		d.SetNew("secret_data", string(secretData))
+	} else {
+		d.SetNew("resource", modifiedSrcJSON)
+		d.SetNew("secret_data", "")
 	}
 
 	originalSrcJSON := originalJSON.(string)
@@ -194,12 +308,6 @@ func kustomizationResourceDiff(d *schema.ResourceDiff, m interface{}) error {
 	}
 
 	ou, err := parseJSON(originalSrcJSON)
-	if err != nil {
-		return logError(fmt.Errorf("JSON parse error: %s", err))
-	}
-
-	modifiedSrcJSON := modifiedJSON.(string)
-	mu, err := parseJSON(modifiedSrcJSON)
 	if err != nil {
 		return logError(fmt.Errorf("JSON parse error: %s", err))
 	}
@@ -317,6 +425,7 @@ func kustomizationResourceExists(d *schema.ResourceData, m interface{}) (bool, e
 func kustomizationResourceUpdate(d *schema.ResourceData, m interface{}) error {
 	client := m.(*Config).Client
 	mapper := m.(*Config).Mapper
+	gzipLastAppliedConfig := m.(*Config).GzipLastAppliedConfig
 
 	originalJSON, modifiedJSON := d.GetChange("manifest")
 
@@ -382,7 +491,7 @@ func kustomizationResourceUpdate(d *schema.ResourceData, m interface{}) error {
 	id := string(patchResp.GetUID())
 	d.SetId(id)
 
-	d.Set("manifest", getLastAppliedConfig(patchResp))
+
 
 	return kustomizationResourceRead(d, m)
 }
@@ -429,26 +538,7 @@ func kustomizationResourceDelete(d *schema.ResourceData, m interface{}) error {
 		)
 	}
 
-	stateConf := &resource.StateChangeConf{
-		Target:  []string{},
-		Pending: []string{"deleting"},
-		Timeout: d.Timeout(schema.TimeoutDelete),
-		Refresh: func() (interface{}, string, error) {
-			resp, err := client.
-				Resource(mappings[0].Resource).
-				Namespace(namespace).
-				Get(context.TODO(), name, k8smetav1.GetOptions{})
-			if err != nil {
-				if k8serrors.IsNotFound(err) {
-					return nil, "", nil
-				}
-				return nil, "", err
-			}
-
-			return resp, "deleting", nil
-		},
-	}
-	_, err = stateConf.WaitForState()
+	_, err = waitForGVKDeleted(d, client, mappings[0], namespace, name)
 	if err != nil {
 		return logErrorForResource(
 			u,
@@ -464,6 +554,7 @@ func kustomizationResourceDelete(d *schema.ResourceData, m interface{}) error {
 func kustomizationResourceImport(d *schema.ResourceData, m interface{}) ([]*schema.ResourceData, error) {
 	client := m.(*Config).Client
 	mapper := m.(*Config).Mapper
+	gzipLastAppliedConfig := m.(*Config).GzipLastAppliedConfig
 
 	k, err := parseEitherIdFormat(d.Id())
 	if err != nil {
@@ -494,14 +585,14 @@ func kustomizationResourceImport(d *schema.ResourceData, m interface{}) ([]*sche
 	id := string(resp.GetUID())
 	d.SetId(id)
 
-	lac := getLastAppliedConfig(resp)
+	lac := getLastAppliedConfig(resp, gzipLastAppliedConfig)
 	if lac == "" {
 		return nil, logError(
-			fmt.Errorf("group: %q, kind: %q, namespace: %q, name: %q: can not import resources without %q annotation", gk.Group, gk.Kind, k.Namespace, k.Name, lastAppliedConfig),
+			fmt.Errorf("group: %q, kind: %q, namespace: %q, name: %q: can not import resources without %q or %q annotation", gk.Group, gk.Kind, k.Namespace, k.Name, lastAppliedConfigAnnotation, gzipLastAppliedConfigAnnotation),
 		)
 	}
 
-	d.Set("manifest", lac)
+	updateStateFromResponse(d, resp)
 
 	return []*schema.ResourceData{d}, nil
 }
