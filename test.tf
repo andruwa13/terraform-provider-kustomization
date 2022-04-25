@@ -1,13 +1,17 @@
 terraform {
   required_providers {
     kustomization = {
-      source = "kbst/kustomization"
+      source = "registry.terraform.io/kbst/kustomization"
       # all test versions are placed as 1.0.0
       # in .terraform/plugins for tests
-      version = ">= 1.0.0"
+      version = "0.8.1-rc1"
     }
   }
   required_version = ">= 0.13"
+}
+
+provider "kustomization" {
+  kubeconfig_path = "~/.kube/config"
 }
 
 data "kustomization_build" "test" {
@@ -40,6 +44,40 @@ data "kustomization_overlay" "test" {
       kind    = "Deployment"
       name    = "test"
     }
+  }
+}
+
+resource "random_password" "password" {
+  length = 16
+  special = true
+  override_special = "_%@"
+}
+
+data "kustomization_overlay" "example" {
+  secret_generator {
+    name = "example-secret1"
+    type = "Opaque"
+    literals = [
+      "password=${random_password.password.result}",
+    ]
+
+    options {
+      disable_name_suffix_hash = true
+    }
+  }
+
+  secret_generator {
+    name = "example-secret2"
+    literals = [
+      "KEY1=VALUE1",
+      "KEY2=VALUE2"
+    ]
+    envs = [
+      "path/to/properties.env"
+    ]
+    files = [
+      "path/to/config/file.cfg"
+    ]
   }
 }
 
